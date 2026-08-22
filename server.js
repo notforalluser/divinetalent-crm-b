@@ -1,30 +1,8 @@
-/**
- * server.js — realtime ATS settings backend
- *
- * - Express REST API for reading/writing the ATS score simulation settings
- *   (atsScoreMin, atsScoreMax, atsEligibilityThreshold, atsGeneralProfile,
- *   atsFilenameOverrides).
- * - Socket.IO pushes every change to all connected devices instantly — set
- *   a score on your phone, it shows up on your laptop with no refresh.
- * - MongoDB persistence is OPTIONAL: set MONGO_URI in .env to enable it.
- *   Without it, settings just live in memory (reset when the server restarts).
- *
- * Run:
- *   npm install
- *   node server.js
- *
- * Env vars (optional, put in a .env file next to this):
- *   PORT=5000
- *   MONGO_URI=mongodb://127.0.0.1:27017/crm-ats-settings
- *
- * On the frontend, point VITE_ATS_SERVER_URL at wherever this is running,
- * e.g. http://192.168.1.23:5000 so your phone and laptop both reach it.
- */
-
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const XLSX = require('xlsx');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 
@@ -85,7 +63,7 @@ function sanitizeAtsSettings(raw) {
 // ---- In-memory state (always the source of truth the app reads/writes to) ----
 let atsSettings = defaultAtsSettings();
 
-// ---- Optional MongoDB setup ----
+// ---- Optional MongoDB setup (ATS settings only) ----
 let AtsSettingsModel = null;
 let useMongo = false;
 
@@ -109,7 +87,6 @@ async function setupMongo() {
     );
     AtsSettingsModel = mongoose.model('AtsSettings', schema);
 
-    // load existing doc, or create it
     let doc = await AtsSettingsModel.findById('singleton');
     if (!doc) {
       doc = await AtsSettingsModel.create({ _id: 'singleton', ...atsSettings });
@@ -131,6 +108,82 @@ async function persist() {
   }
 }
 
+// ============================================================================
+// CRM dataset (crm-data.xlsx)
+//
+// The RAW FILE now lives on Hostinger (persistent PHP storage), not on
+// Render's disk (which is wiped on every restart/redeploy). Node's job is
+// unchanged otherwise: pull the bytes, parse them ONCE with the "xlsx"
+// package, cache the JSON in memory, and broadcast it over Socket.IO. The
+// browser never parses anything — it only ever receives this cached JSON.
+//
+// Flow:
+//  - On boot, Node pulls the current file from Hostinger to warm the cache.
+//  - Hostinger's crm-upload.php / crm-reset.php ping POST /api/crm-data/sync
+//    after every change, which makes Node re-pull + re-parse + rebroadcast.
+//  - GET /api/crm-data always just serves whatever is currently cached —
+//    fast, no network hop, no parsing — same as before.
+// ============================================================================
+
+const CRM_SHEETS = ['Candidates', 'Jobs', 'Recruiters', 'Interviews', 'TechnicalHelp', 'Activity', 'MarketingActivity'];
+const EMPTY_CRM_SHEETS = Object.fromEntries(CRM_SHEETS.map((s) => [s, []]));
+
+// Hostinger's crm-data-file.php — the endpoint Node fetches the raw .xlsx from.
+const HOSTINGER_FILE_URL = process.env.HOSTINGER_FILE_URL || 'https://YOUR-DOMAIN.com/api/crm-data-file.php';
+// Must match SYNC_SECRET in Hostinger's config.php exactly.
+const CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || '';
+
+let crmData = { ...EMPTY_CRM_SHEETS, fetchedAt: null, source: null };
+
+/**
+ * Pulls the current .xlsx from Hostinger, parses it, and updates the cache.
+ * IMPORTANT: on failure, the existing cache is left untouched — a Hostinger
+ * hiccup should never wipe a dashboard that was working a second ago.
+ * Returns true on success, false on failure.
+ */
+async function pullCrmDataFromHostinger() {
+  if (!CRM_SYNC_SECRET) {
+    console.error('CRM_SYNC_SECRET is not set — refusing to pull CRM data.');
+    return false;
+  }
+  try {
+    const res = await fetch(HOSTINGER_FILE_URL, {
+      headers: { 'X-Crm-Secret': CRM_SYNC_SECRET },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Hostinger returned ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    const sourceType = res.headers.get('x-source-type') || 'uploaded';
+    const sourceName = decodeURIComponent(res.headers.get('x-source-name') || 'crm-data.xlsx');
+    const sourceUploadedAt = res.headers.get('x-source-uploaded-at')
+      ? decodeURIComponent(res.headers.get('x-source-uploaded-at'))
+      : undefined;
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+
+    const parsed = {};
+    for (const sheetName of CRM_SHEETS) {
+      const sheet = workbook.Sheets[sheetName];
+      parsed[sheetName] = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : [];
+    }
+
+    crmData = {
+      ...parsed,
+      fetchedAt: new Date().toISOString(),
+      source: sourceType === 'bundled' ? { type: 'bundled', name: sourceName } : { type: 'uploaded', name: sourceName, uploadedAt: sourceUploadedAt },
+    };
+
+    console.log(`CRM dataset refreshed from Hostinger (${sourceType}: ${sourceName}).`);
+    return true;
+  } catch (err) {
+    console.error('Failed to pull CRM dataset from Hostinger — keeping last known cache:', err.message);
+    return false;
+  }
+}
+
 // ---- Express + Socket.IO setup ----
 const app = express();
 app.use(cors());
@@ -145,13 +198,15 @@ function broadcast() {
   io.emit('atsSettingsUpdate', atsSettings); // pushed to every connected device instantly
 }
 
-// GET current settings — used on first load, and as a fallback if a client
-// ever needs to re-sync outside of the socket connection.
+function broadcastCrmData() {
+  io.emit('crmDataUpdate', crmData); // pushed to every connected device instantly
+}
+
+// GET current settings.
 app.get('/api/ats-settings', (req, res) => {
   res.json(atsSettings);
 });
 
-// PUT a single top-level field: atsScoreMin | atsScoreMax | atsEligibilityThreshold
 app.put('/api/ats-settings/field', async (req, res) => {
   const { key, value } = req.body || {};
   const allowed = ['atsScoreMin', 'atsScoreMax', 'atsEligibilityThreshold'];
@@ -164,7 +219,6 @@ app.put('/api/ats-settings/field', async (req, res) => {
   res.json(atsSettings);
 });
 
-// PUT the general (no filename override) simulated profile
 app.put('/api/ats-settings/general-profile', async (req, res) => {
   const { partial } = req.body || {};
   atsSettings = {
@@ -176,7 +230,6 @@ app.put('/api/ats-settings/general-profile', async (req, res) => {
   res.json(atsSettings);
 });
 
-// POST create or update a filename override (e.g. "resume.pdf" -> 79)
 app.post('/api/ats-settings/overrides', async (req, res) => {
   const { id, filename, minScore, profile } = req.body || {};
   const trimmed = (filename || '').trim();
@@ -205,7 +258,6 @@ app.post('/api/ats-settings/overrides', async (req, res) => {
   res.json(atsSettings);
 });
 
-// DELETE a filename override
 app.delete('/api/ats-settings/overrides/:id', async (req, res) => {
   const { id } = req.params;
   atsSettings = {
@@ -217,7 +269,6 @@ app.delete('/api/ats-settings/overrides/:id', async (req, res) => {
   res.json(atsSettings);
 });
 
-// POST reset everything back to defaults
 app.post('/api/ats-settings/reset', async (req, res) => {
   atsSettings = defaultAtsSettings();
   await persist();
@@ -225,7 +276,6 @@ app.post('/api/ats-settings/reset', async (req, res) => {
   res.json(atsSettings);
 });
 
-// POST wholesale replace — used by "Import settings" on the Settings page
 app.post('/api/ats-settings/replace', async (req, res) => {
   const { atsSettings: incoming } = req.body || {};
   atsSettings = sanitizeAtsSettings(incoming);
@@ -234,21 +284,54 @@ app.post('/api/ats-settings/replace', async (req, res) => {
   res.json(atsSettings);
 });
 
+// ---- CRM dataset routes ----
+
+// GET the currently cached, already-parsed dataset — this is the only route
+// the frontend's normal read path ever calls.
+app.get('/api/crm-data', (req, res) => {
+  res.json(crmData);
+});
+
+// Webhook: Hostinger's crm-upload.php / crm-reset.php call this after every
+// change. Re-pulls the file, re-parses it, and broadcasts the result.
+app.post('/api/crm-data/sync', async (req, res) => {
+  const given = req.headers['x-crm-secret'] || '';
+  if (given !== CRM_SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const ok = await pullCrmDataFromHostinger();
+  if (ok) broadcastCrmData();
+  res.status(ok ? 200 : 502).json({ ok, source: crmData.source });
+});
+
+// Manual/admin re-sync — handy for debugging without touching Hostinger.
+app.get('/api/crm-data/resync', async (req, res) => {
+  const given = req.headers['x-crm-secret'] || '';
+  if (given !== CRM_SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const ok = await pullCrmDataFromHostinger();
+  if (ok) broadcastCrmData();
+  res.status(ok ? 200 : 502).json({ ok, source: crmData.source });
+});
+
 // Socket.IO: realtime channel
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
-
-  // send current state immediately on connect
   socket.emit('atsSettingsUpdate', atsSettings);
+  socket.emit('crmDataUpdate', crmData);
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
   });
 });
 
-setupMongo().finally(() => {
+async function start() {
+  await setupMongo();
+  await pullCrmDataFromHostinger(); // warm the cache on boot — if this fails, we start empty and wait for the next upload's webhook ping (or hit /api/crm-data/resync manually)
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`ATS settings server running on http://0.0.0.0:${PORT}`);
-    console.log('On your phone, use your laptop\'s LAN IP, e.g. http://192.168.x.x:' + PORT);
+    console.log(`Backend running on http://0.0.0.0:${PORT}`);
   });
-});
+}
+
+start();
