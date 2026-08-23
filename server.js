@@ -12,7 +12,6 @@ const MONGO_URI = process.env.MONGO_URI || '';
 // Same ceiling the frontend already enforces (SettingsContext.jsx) — kept
 // here too so a direct API call (or a bug on the client) can never push a
 // score above it.
-// 
 const MAX_ATS_SCORE = 94;
 
 function clampScore(n, fallback) {
