@@ -139,16 +139,24 @@ let crmData = { ...EMPTY_CRM_SHEETS, fetchedAt: null, source: null };
  * Pulls the current .xlsx from Hostinger, parses it, and updates the cache.
  * IMPORTANT: on failure, the existing cache is left untouched — a Hostinger
  * hiccup should never wipe a dashboard that was working a second ago.
- * Returns true on success, false on failure.
+ * Retries a couple of times with a short delay first, since most failures
+ * seen in practice are transient (e.g. right after a cold start, before
+ * outbound networking is fully warmed up) and resolve themselves within a
+ * few seconds. Returns true on success, false if every attempt failed.
  */
-async function pullCrmDataFromHostinger() {
+async function pullCrmDataFromHostinger(attempt = 1) {
+  const MAX_ATTEMPTS = 3;
   if (!CRM_SYNC_SECRET) {
     console.error('CRM_SYNC_SECRET is not set — refusing to pull CRM data.');
     return false;
   }
   try {
     const res = await fetch(HOSTINGER_FILE_URL, {
-      headers: { 'X-Crm-Secret': CRM_SYNC_SECRET },
+      headers: {
+        'X-Crm-Secret': CRM_SYNC_SECRET,
+        'User-Agent': 'DivineTalent-CRM-Backend/1.0', // some hosts block requests with no User-Agent at all
+      },
+      signal: AbortSignal.timeout(20000), // fail clearly after 20s instead of hanging
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -179,7 +187,13 @@ async function pullCrmDataFromHostinger() {
     console.log(`CRM dataset refreshed from Hostinger (${sourceType}: ${sourceName}).`);
     return true;
   } catch (err) {
-    console.error('Failed to pull CRM dataset from Hostinger — keeping last known cache:', err.message);
+    const detail = err.cause ? ` | cause: ${err.cause.code || ''} ${err.cause.message || err.cause}` : '';
+    if (attempt < MAX_ATTEMPTS) {
+      console.warn(`CRM pull attempt ${attempt}/${MAX_ATTEMPTS} failed (${err.message}${detail}) — retrying in 3s...`);
+      await new Promise((r) => setTimeout(r, 3000));
+      return pullCrmDataFromHostinger(attempt + 1);
+    }
+    console.error('Failed to pull CRM dataset from Hostinger — keeping last known cache:', err.message + detail);
     return false;
   }
 }
@@ -294,25 +308,35 @@ app.get('/api/crm-data', (req, res) => {
 
 // Webhook: Hostinger's crm-upload.php / crm-reset.php call this after every
 // change. Re-pulls the file, re-parses it, and broadcasts the result.
-app.post('/api/crm-data/sync', async (req, res) => {
+//
+// Responds immediately (doesn't wait for the pull/retries to finish) --
+// with retries, a fully-failing pull can take up to ~65s, which is longer
+// than Render's own proxy timeout, so waiting on it here caused spurious
+// 502s even when the retry logic itself was working fine in the
+// background. The actual result still reaches the frontend via the socket
+// broadcast the moment it's ready.
+app.post('/api/crm-data/sync', (req, res) => {
   const given = req.headers['x-crm-secret'] || '';
   if (given !== CRM_SYNC_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const ok = await pullCrmDataFromHostinger();
-  if (ok) broadcastCrmData();
-  res.status(ok ? 200 : 502).json({ ok, source: crmData.source });
+  res.status(202).json({ ok: true, message: 'Sync started — check /api/crm-data shortly, or watch for the socket update.' });
+  pullCrmDataFromHostinger().then((ok) => {
+    if (ok) broadcastCrmData();
+  });
 });
 
 // Manual/admin re-sync — handy for debugging without touching Hostinger.
-app.get('/api/crm-data/resync', async (req, res) => {
+// Same fire-and-forget shape as /sync above, for the same reason.
+app.get('/api/crm-data/resync', (req, res) => {
   const given = req.headers['x-crm-secret'] || '';
   if (given !== CRM_SYNC_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  const ok = await pullCrmDataFromHostinger();
-  if (ok) broadcastCrmData();
-  res.status(ok ? 200 : 502).json({ ok, source: crmData.source });
+  res.status(202).json({ ok: true, message: 'Sync started — check /api/crm-data in a few seconds.' });
+  pullCrmDataFromHostinger().then((ok) => {
+    if (ok) broadcastCrmData();
+  });
 });
 
 // Socket.IO: realtime channel
