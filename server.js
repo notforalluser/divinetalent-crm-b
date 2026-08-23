@@ -397,7 +397,11 @@ io.on('connection', (socket) => {
 
 async function start() {
   await setupMongo();
-  await pullCrmDataFromHostinger(); // warm the cache on boot — if this fails, we start empty and wait for the next upload's webhook ping (or hit /api/crm-data/resync manually)
+  // No boot-time pull here anymore -- Render pulling FROM Hostinger is the
+  // blocked direction (see pullCrmDataFromHostinger's retry logic, kept as
+  // a manual fallback via /api/crm-data/resync only). The cache starts
+  // empty on a fresh boot and self-heals within ~10 minutes via Hostinger's
+  // cron-push.php, or instantly on the next real upload/reset.
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Backend running on http://0.0.0.0:${PORT}`);
   });
