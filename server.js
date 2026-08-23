@@ -326,7 +326,52 @@ app.post('/api/crm-data/sync', (req, res) => {
   });
 });
 
-// Manual/admin re-sync — handy for debugging without touching Hostinger.
+// PRIMARY sync path: Hostinger's crm-upload.php / crm-reset.php / cron-push.php
+// POST the raw .xlsx bytes here directly, instead of Node fetching them back
+// from Hostinger (that pull direction proved unreliable -- see
+// pullCrmDataFromHostinger's retry logic above, kept as a manual fallback).
+// This direction (Hostinger -> Render) has been reliable throughout, so this
+// is now how the cache actually gets updated day to day.
+app.post('/api/crm-data/receive', express.raw({ type: '*/*', limit: '100mb' }), (req, res) => {
+  const given = req.headers['x-crm-secret'] || '';
+  if (given !== CRM_SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const buffer = req.body; // raw Buffer, thanks to express.raw() above
+    if (!buffer || !buffer.length) {
+      return res.status(400).json({ error: 'No file data received' });
+    }
+
+    const sourceType = req.headers['x-source-type'] || 'uploaded';
+    const sourceName = decodeURIComponent(req.headers['x-source-name'] || 'crm-data.xlsx');
+    const sourceUploadedAt = req.headers['x-source-uploaded-at']
+      ? decodeURIComponent(req.headers['x-source-uploaded-at'])
+      : undefined;
+
+    const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+    const parsed = {};
+    for (const sheetName of CRM_SHEETS) {
+      const sheet = workbook.Sheets[sheetName];
+      parsed[sheetName] = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : [];
+    }
+
+    crmData = {
+      ...parsed,
+      fetchedAt: new Date().toISOString(),
+      source: sourceType === 'bundled' ? { type: 'bundled', name: sourceName } : { type: 'uploaded', name: sourceName, uploadedAt: sourceUploadedAt },
+    };
+
+    console.log(`CRM dataset received via push from Hostinger (${sourceType}: ${sourceName}).`);
+    broadcastCrmData();
+    res.json({ ok: true, source: crmData.source });
+  } catch (err) {
+    console.error('Failed to parse pushed CRM dataset:', err.message);
+    res.status(400).json({ error: 'Could not parse the uploaded file: ' + err.message });
+  }
+});
+
+
 // Same fire-and-forget shape as /sync above, for the same reason.
 app.get('/api/crm-data/resync', (req, res) => {
   const given = req.headers['x-crm-secret'] || '';
